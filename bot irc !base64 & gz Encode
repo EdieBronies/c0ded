@@ -1,0 +1,115 @@
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use IO::Socket::INET;
+use MIME::Base64;
+use Compress::Zlib;
+
+# Konfigurasi Koneksi IRC
+my $server  = "irc.server.net";
+my $port    = 6667;
+my $nickname = "CoderBot";
+my $ircname  = "Perl Encoder Bot";
+my $channel  = "#channel";
+my $admin    = "c0ded";
+
+# Fungsi Utama Encoders & Decoders
+sub b64_encode {
+    my ($data) = @_;
+    return encode_base64($data, '');
+}
+
+sub b64_decode {
+    my ($data) = @_;
+    return decode_base64($data);
+}
+
+sub gz_b64_encode {
+    my ($data) = @_;
+    my $compressed = compress($data);
+    return defined $compressed ? encode_base64($compressed, '') : "Error kompresi";
+}
+
+sub gz_b64_decode {
+    my ($data) = @_;
+    my $decoded_b64 = decode_base64($data);
+    my $uncompressed = uncompress($decoded_b64);
+    return defined $uncompressed ? $uncompressed : "Error: Data rusak/bukan format Gzip";
+}
+
+# Melakukan Koneksi ke Server IRC
+print "[*] Menghubungkan ke $server:$port...\n";
+my $socket = IO::Socket::INET->new(
+    PeerAddr => $server,
+    PeerPort => $port,
+    Proto    => 'tcp'
+) or die "[-] Gagal terhubung ke IRC: $!\n";
+
+# Autentikasi Nickname ke IRC
+print $socket "USER $nickname 0 * :$ircname\r\n";
+print $socket "NICK $nickname\r\n";
+
+# Membaca Data Aliran Masuk (IRC Loop)
+while (my $line = <$socket>) {
+    $line =~ s/\r\n$//; # Bersihkan karakter ujung baris
+    print "IRC: $line\n"; # Tampilkan log aktivitas ke terminal Anda
+
+    # Menjawab PING server agar bot tidak terkena Ping Timeout (Disconnect)
+    if ($line =~ /^PING :(.*)$/) {
+        print $socket "PONG :$1\r\n";
+        next;
+    }
+
+    # Deteksi ketika bot sukses terhubung penuh, lalu otomatis masuk ke Channel
+    if ($line =~ / 001 $nickname /) {
+        print "[+] Sukses terhubung! Masuk ke channel $channel...\n";
+        print $socket "JOIN $channel\r\n";
+    }
+
+    # Menangani Pesan di Channel (PRIVMSG)
+    # Format IRC: :Nick!User@Host PRIVMSG #channel :isi_pesan
+    if ($line =~ /^:(.+?)!.+? PRIVMSG ($channel) :(!\w+)(.*)$/) {
+        my $user_sender = $1;
+        my $target_chan = $2;
+        my $command     = $3;
+        my $arguments   = $4;
+        
+        # Bersihkan spasi di awal argumen
+        $arguments =~ s/^\s+//;
+
+        # Proteksi Hak Akses Admin (Hanya merespons perintah jika dikirim oleh UnDerHCK)
+        if ($user_sender ne $admin) {
+            # Opsional: Jika user lain mencoba pakai bot, abaikan atau beri peringatan
+            next; 
+        }
+
+        # Variabel penampung hasil proses teks
+        my $hasil_respon = "";
+
+        # Seleksi Perintah/Command dari Admin
+        if ($command eq "!b64encode") {
+            if ($arguments) { $hasil_respon = b64_encode($arguments); }
+            else { $hasil_respon = "Format salah. Gunakan: !b64encode <teks>"; }
+        }
+        elsif ($command eq "!b64decode") {
+            if ($arguments) { $hasil_respon = b64_decode($arguments); }
+            else { $hasil_respon = "Format salah. Gunakan: !b64decode <hash>"; }
+        }
+        elsif ($command eq "!gzencode") {
+            if ($arguments) { $hasil_respon = gz_b64_encode($arguments); }
+            else { $hasil_respon = "Format salah. Gunakan: !gzencode <teks>"; }
+        }
+        elsif ($command eq "!gzdecode") {
+            if ($arguments) { $hasil_respon = gz_b64_decode($arguments); }
+            else { $hasil_respon = "Format salah. Gunakan: !gzdecode <hash>"; }
+        }
+        elsif ($command eq "!ping") {
+            $hasil_respon = "Pong! Bot aktif, master $admin.";
+        }
+
+        # Jika ada hasil respon, kirimkan kembali teks tersebut ke dalam channel IRC
+        if ($hasil_respon) {
+            print $socket "PRIVMSG $target_chan :$user_sender: $hasil_respon\r\n";
+        }
+    }
+}
