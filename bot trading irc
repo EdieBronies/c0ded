@@ -1,0 +1,200 @@
+import sys
+import time
+import threading
+import irc.bot
+import ccxt
+import pandas as pd
+from ta.momentum import RSIIndicator
+from ta.trend import MACD
+
+TOKOCRYPTO_CONFIG = {
+    'apiKey': 'KODE_API_KEY_ANDA_DI_SINI',
+    'secret': 'KODE_SECRET_KEY_ANDA_DI_SINI',
+}
+
+IRC_SERVER = "irc.server.net"
+IRC_PORT = 6667
+IRC_NICK = "Bot"
+IRC_CHANNEL = "#bchannel"
+PASSWORD_ADMIN = "Rahasia123" 
+
+TRADING_PAIR = "BTC/BIDR"     
+TIMEFRAME = "5m"              
+ALOKASI_DANA = 500000.0       
+RSI_OVERSOLD = 30             
+RSI_OVERBOUGHT = 70            
+STOP_LOSS_PCT = 0.02          
+
+posisi_aktif = False
+harga_beli_terakhir = 0.0
+jumlah_koin_dimiliki = 0.0
+admin_terautentikasi = {}  
+exchange = None 
+
+def hitung_indikator_dan_trade(bot_irc):
+    global posisi_aktif, harga_beli_terakhir, jumlah_koin_dimiliki, exchange
+    try:
+        if exchange is None:
+            return
+        ohlcv = exchange.fetch_ohlcv(TRADING_PAIR, TIMEFRAME, limit=50)
+        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        rsi_series = RSIIndicator(close=df['close'], window=14).rsi()
+        macd_obj = MACD(close=df['close'], window_fast=12, window_slow=26, window_sign=9)
+        rsi_sekarang = rsi_series.iloc[-1]
+        macd_line = macd_obj.macd().iloc[-1]
+        macd_signal = macd_obj.macd_signal().iloc[-1]
+        harga_sekarang = df['close'].iloc[-1]
+        print(f"[{TRADING_PAIR}] Live Scan - Harga: {harga_sekarang} | RSI: {rsi_sekarang:.2f} | MACD: {macd_line:.4f}")
+        
+        if posisi_aktif:
+            harga_stop_loss = harga_beli_terakhir * (1.0 - STOP_LOSS_PCT)
+            if harga_sekarang <= harga_stop_loss:
+                msg = f"🚨 [STOP LOSS] Harga menyentuh batas cut loss ({harga_stop_loss}). Mengeksekusi JUAL pasar!"
+                bot_irc.kirim_pesan_global(msg)
+                exchange.create_market_sell_order(TRADING_PAIR, jumlah_koin_dimiliki)
+                posisi_aktif = False
+                return
+        if not posisi_aktif:
+            if rsi_sekarang <= RSI_OVERSOLD and macd_line > macd_signal:
+                msg = f"🟢 [SINYAL BELI] RSI Jenuh Jual ({rsi_sekarang:.2f}) & MACD Golden Cross. Membeli senilai {ALOKASI_DANA} BIDR."
+                bot_irc.kirim_pesan_global(msg)
+                order = exchange.create_market_buy_order(TRADING_PAIR, ALOKASI_DANA)
+                harga_beli_terakhir = harga_sekarang
+                jumlah_koin_dimiliki = order['filled']
+                posisi_aktif = True
+        else:
+            if rsi_sekarang >= RSI_OVERBOUGHT or macd_line < macd_signal:
+                msg = f"🔴 [SINYAL JUAL] RSI Jenuh Beli ({rsi_sekarang:.2f}) atau MACD Death Cross. Mengeksekusi Penjualan Untung!"
+                bot_irc.kirim_pesan_global(msg)
+                exchange.create_market_sell_order(TRADING_PAIR, jumlah_koin_dimiliki)
+                posisi_aktif = False
+    except Exception as e:
+        print(f"Error pada loop strategi trading: {e}")
+
+def auto_trading_loop(bot_irc):
+    print("[SYSTEM] Auto Trading Engine Berhasil Dijalankan di Latar Belakang...")
+    while True:
+        hitung_indikator_dan_trade(bot_irc)
+        time.sleep(60)
+
+class BHLBotClass(irc.bot.SingleServerIRCBot):
+    def __init__(self, channel, nickname, server, port=6667):
+        print(f"[SYSTEM] Menghubungkan ke Server IRC {server}:{port}...")
+        irc.bot.SingleServerIRCBot.__init__(self, [(server, port)], nickname, nickname)
+        self.channel = channel
+
+    def on_welcome(self, c, e):
+        global exchange
+        print(f"[SYSTEM] Berhasil masuk server IRC! Mencoba bergabung ke channel {self.channel}...")
+        c.join(self.channel)
+        try:
+            print("[SYSTEM] Mengaktifkan koneksi API Tokocrypto...")
+            exchange = ccxt.tokocrypto({
+                'apiKey': TOKOCRYPTO_CONFIG['apiKey'],
+                'secret': TOKOCRYPTO_CONFIG['secret'],
+                'enableRateLimit': True,
+            })
+            print("[SYSTEM] API Tokocrypto Siap Digunakan.")
+        except Exception as api_err:
+            print(f"[ERROR] Gagal inisialisasi Tokocrypto API: {api_err}")
+        t = threading.Thread(target=auto_trading_loop, args=(self,))
+        t.daemon = True
+        t.start()
+
+    def kirim_pesan_global(self, pesan):
+        try:
+            self.connection.privmsg(self.channel, pesan)
+        except Exception:
+            pass
+
+    def on_pubmsg(self, c, e):
+        self.proses_pesan(c, e, e.target, is_public=True)
+
+    def on_privmsg(self, c, e):
+        self.proses_pesan(c, e, e.source.nick, is_public=False)
+
+    def proses_pesan(self, c, e, target_balasan, is_public):
+        try:
+            if not e.arguments or len(e.arguments) == 0:
+                return
+            pesan = str(e.arguments[0]).strip()
+            pengirim = e.source.nick
+            hostmask = str(e.source)
+            print(f"[IRC Log] Pengirim: {pengirim} | Target: {target_balasan} | Teks: {pesan}")
+
+            if pesan.lower().startswith("!help"):
+                is_admin = admin_terautentikasi.get(pengirim) == hostmask
+                c.privmsg(target_balasan, f"📜 --- MENU BANTUAN {IRC_NICK} ---")
+                c.privmsg(target_balasan, "🔹 Perintah Publik:")
+                c.privmsg(target_balasan, "   !help          - Menampilkan menu bantuan ini.")
+                c.privmsg(target_balasan, "   !status        - Mengecek status live strategi algoritma bot.")
+                c.privmsg(target_balasan, "   !harga <pair>  - Cek harga pasar koin (Contoh: !harga BTC/USDT).")
+                c.privmsg(target_balasan, "   !login <pwd>   - (Gunakan di PM) Mengaktifkan akses kontrol admin.")
+                if is_admin:
+                    c.privmsg(target_balasan, "🔸 Perintah Khusus Admin Terverifikasi:")
+                    c.privmsg(target_balasan, "   !saldo         - Cek saldo BIDR & USDT real-time di Tokocrypto.")
+                else:
+                    c.privmsg(target_balasan, "📌 Catatan: Fitur keuangan tersembunyi. Ketik '!login <password>' via PM untuk hak akses penuh.")
+
+            elif pesan.lower().startswith("!harga"):
+                parts = pesan.split()
+                if len(parts) < 2:
+                    c.privmsg(target_balasan, f"{pengirim}: Format salah. Gunakan: !harga SYMBOL (Contoh: !harga BTC/USDT)")
+                    return
+                try:
+                    symbol = parts[1].upper()
+                    ticker = exchange.fetch_ticker(symbol)
+                    harga_terakhir = ticker['last']
+                    c.privmsg(target_balasan, f"📈 Tokocrypto | Harga {symbol} saat ini: {harga_terakhir}")
+                except Exception as err:
+                    c.privmsg(target_balasan, f"❌ Gagal mengambil harga: {str(err)}")
+
+            elif pesan.lower().startswith("!login"):
+                if is_public:
+                    c.privmsg(target_balasan, f"⚠️ {pengirim}: Demi keamanan, ketik perintah !login hanya melalui PM/Query!")
+                    return
+                parts = pesan.split()
+                if len(parts) < 2:
+                    c.privmsg(target_balasan, "Format salah. Gunakan: !login <password_anda>")
+                    return
+                if parts[1] == PASSWORD_ADMIN:
+                    admin_terautentikasi[pengirim] = hostmask
+                    c.privmsg(target_balasan, f"✅ Login Berhasil! Anda sekarang terdaftar sebagai Admin terverifikasi.")
+                    print(f"[SECURITY] Admin baru terdaftar: {pengirim} ({hostmask})")
+                else:
+                    c.privmsg(target_balasan, "❌ Password salah. Akses ditolak.")
+
+            elif pesan.lower().startswith("!status"):
+                status_teks = "Sedang Memegang Aset" if posisi_aktif else "Menunggu Sinyal Beli (Kosong)"
+                persen_sl = float(STOP_LOSS_PCT) * 100
+                c.privmsg(target_balasan, f"🤖 [Status Bot] Pasangan: {TRADING_PAIR} | Mode: {status_teks} | SL: {persen_sl:.1f}%")
+                if posisi_aktif:
+                    c.privmsg(target_balasan, f"📊 Masuk di harga: {harga_beli_terakhir} | Jumlah Aset: {jumlah_koin_dimiliki}")
+
+            elif pesan.lower().startswith("!saldo"):
+                if admin_terautentikasi.get(pengirim) != hostmask:
+                    c.privmsg(target_balasan, f"⚠️ Akses ditolak! Silakan ketik '!login <password>' via PM terlebih dahulu.")
+                    return
+                try:
+                    if exchange is None:
+                        c.privmsg(target_balasan, "❌ Sistem API Tokocrypto belum aktif.")
+                        return
+                    balance = exchange.fetch_balance()
+                    saldo_bidr = balance.get('BIDR', {}).get('free', 0.0)
+                    saldo_usdt = balance.get('USDT', {}).get('free', 0.0)
+                    c.privmsg(target_balasan, f"💰 [Saldo] Sisa BIDR: {saldo_bidr:,.2f} | USDT: {saldo_usdt:.4f}")
+                except Exception as err:
+                    c.privmsg(target_balasan, f"❌ Gagal mengambil data Tokocrypto: {str(err)}")
+        except Exception as crash_error:
+            print(f"Eror internal berhasil diredam: {crash_error}")
+
+if __name__ == "__main__":
+    try:
+        print("[SYSTEM] Memulai inisialisasi aplikasi BHLBot...")
+        bot = BHLBotClass(IRC_CHANNEL, IRC_NICK, IRC_SERVER, IRC_PORT)
+        bot.start()
+    except KeyboardInterrupt:
+        print("\n[SYSTEM] Bot dimatikan secara manual.")
+        sys.exit(0)
+    except Exception as e:
+        print(f"[CRITICAL ERROR] Aplikasi gagal berjalan: {e}")
